@@ -1,0 +1,315 @@
+// ============================================
+// PRISMA SCHEMA — Quizlet Clone + 4 kỹ năng
+// DB: Neon (Postgres)
+// Lưu ý: từ Prisma 7, KHÔNG khai báo url ở đây nữa.
+// Connection string được đọc từ prisma.config.ts (lấy từ DATABASE_URL trong .env)
+// ============================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================
+// ENUM
+// ============================================
+
+// Kỹ năng — dùng để tách progress SRS riêng cho từng loại luyện tập
+// Vì "thuộc nghĩa từ" (FLASHCARD) và "nói đúng từ đó" (SPEAKING) là 2 năng lực độc lập,
+// không thể dùng chung 1 bộ chỉ số ease/interval
+enum Skill {
+  FLASHCARD // học thẻ cơ bản (Đọc nghĩa)
+  LISTENING // nghe TTS rồi đoán từ
+  WRITING   // gõ lại đáp án
+  SPEAKING  // nói ra, chấm qua Speech-to-Text
+}
+
+// Loại câu hỏi cho phần Đọc hiểu
+enum QuestionType {
+  MULTIPLE_CHOICE
+  TRUE_FALSE
+}
+
+// ============================================
+// NHÓM 1 — CORE (giống cấu trúc Quizlet gốc)
+// ============================================
+
+model User {
+  id        String   @id // dùng luôn Clerk userId, không tự sinh id riêng
+  email     String   @unique
+  name      String?
+  avatarUrl String?
+  createdAt DateTime @default(now())
+
+  folders        Folder[]
+  sets           Set[]           // set do user này tạo
+  favoriteSets   FavoriteSet[]
+  cardProgress   UserCardProgress[]
+  attemptLogs    StudyAttemptLog[]
+  writingAttempts WritingAttempt[]
+  videoLessons       VideoLesson[]
+  shadowingAttempts  ShadowingAttempt[]
+  dictationAttempts  DictationAttempt[]
+}
+
+model Folder {
+  id        String   @id @default(cuid())
+  name      String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  folderSets FolderSet[]
+}
+
+// Bảng trung gian n-n: 1 Set có thể nằm trong nhiều Folder, 1 Folder chứa nhiều Set
+model FolderSet {
+  folderId String
+  setId    String
+  folder   Folder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  set      Set    @relation(fields: [setId], references: [id], onDelete: Cascade)
+
+  @@id([folderId, setId])
+}
+
+model Set {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  language    String   // ngôn ngữ đang học, vd "en", "zh"
+  isPublic    Boolean  @default(true)
+  userId      String   // người tạo
+  user        User     @relation(fields: [userId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  cards           Card[]
+  folderSets      FolderSet[]
+  favoritedBy     FavoriteSet[]
+  readingPassages ReadingPassage[]
+  writingExercises WritingExercise[]
+}
+
+model Card {
+  id         String  @id @default(cuid())
+  setId      String
+  set        Set     @relation(fields: [setId], references: [id], onDelete: Cascade)
+  term       String  // từ vựng
+  definition String  // nghĩa
+  example    String? // câu ví dụ
+  imageUrl   String?
+  order      Int     @default(0) // thứ tự hiển thị trong set
+
+  progress    UserCardProgress[]
+  attemptLogs StudyAttemptLog[]
+  videoVocabulary VideoVocabulary[]
+}
+
+// User đánh dấu yêu thích Set — quan hệ n-n
+model FavoriteSet {
+  userId    String
+  setId     String
+  user      User     @relation(fields: [userId], references: [id])
+  set       Set      @relation(fields: [setId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, setId])
+}
+
+// ============================================
+// NHÓM 2 — SRS ĐA KỸ NĂNG (trái tim của hệ thống ôn tập)
+// ============================================
+
+model UserCardProgress {
+  id     String @id @default(cuid())
+  userId String
+  cardId String
+  skill  Skill // progress tách riêng theo từng kỹ năng
+
+  user User @relation(fields: [userId], references: [id])
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  // --- Các trường phục vụ thuật toán SM-2 (spaced repetition) ---
+  easeFactor  Float    @default(2.5) // độ dễ, càng cao thì giãn cách ôn tập càng dài
+  interval    Int      @default(1)   // số ngày tới lần ôn kế tiếp
+  repetitions Int      @default(0)   // số lần trả lời đúng liên tiếp
+  nextReview  DateTime @default(now()) // ngày cần ôn lại
+  lastReview  DateTime?
+
+  // 1 user chỉ có đúng 1 dòng progress cho 1 card ở 1 skill nhất định
+  @@unique([userId, cardId, skill])
+}
+
+// ============================================
+// NHÓM 3 — ĐỌC & LOG LUYỆN TẬP
+// ============================================
+
+model ReadingPassage {
+  id      String @id @default(cuid())
+  setId   String
+  set     Set    @relation(fields: [setId], references: [id], onDelete: Cascade)
+  title   String
+  content String @db.Text
+
+  questions ReadingQuestion[]
+}
+
+model ReadingQuestion {
+  id         String        @id @default(cuid())
+  passageId  String
+  passage    ReadingPassage @relation(fields: [passageId], references: [id], onDelete: Cascade)
+  type       QuestionType
+  question   String
+  options    String[]      // dùng cho MULTIPLE_CHOICE, để rỗng nếu TRUE_FALSE
+  answer     String        // đáp án đúng (so khớp với 1 phần tử trong options)
+}
+
+// Lưu lịch sử mỗi lần luyện Viết/Nói — dùng để thống kê tiến độ
+// và để sau này đánh giá/tinh chỉnh lại thuật toán chấm (Levenshtein, STT...)
+model StudyAttemptLog {
+  id         String   @id @default(cuid())
+  userId     String
+  cardId     String
+  skill      Skill    // chỉ WRITING hoặc SPEAKING dùng bảng này
+  userInput  String   // text user gõ, hoặc transcript từ Speech-to-Text
+  isCorrect  Boolean
+  score      Float?   // điểm gần đúng, vd từ Levenshtein distance (0-1)
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+}
+
+enum WritingExerciseType {
+  ERROR_CORRECTION // tìm và sửa lỗi trong đoạn văn
+  FREE_WRITE        // viết tự do theo chủ đề, AI chấm
+}
+
+model WritingExercise {
+  id           String              @id @default(cuid())
+  setId        String
+  set          Set                 @relation(fields: [setId], references: [id], onDelete: Cascade)
+  type         WritingExerciseType
+  title        String
+  originalText String?             @db.Text // bản gốc đúng (dùng để so sánh khi chấm ERROR_CORRECTION)
+  exerciseText String?             @db.Text // bản có lỗi, hiển thị cho user luyện sửa
+  topic        String?             // chủ đề, dùng cho FREE_WRITE
+  suggestions  String[]            // gợi ý ý tưởng, dùng cho FREE_WRITE
+  createdAt    DateTime            @default(now())
+
+  attempts WritingAttempt[]
+}
+
+model WritingAttempt {
+  id         String   @id @default(cuid())
+  userId     String
+  exerciseId String
+  exercise   WritingExercise @relation(fields: [exerciseId], references: [id], onDelete: Cascade)
+  userAnswer String   @db.Text
+  feedback   String?  @db.Text // nhận xét từ AI
+  score      Float?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+// ============================================
+// NHÓM 4 — VIDEO LEARNING (module mới, độc lập với hệ thống Set/Card cũ)
+// ============================================
+
+model VideoLesson {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  title       String
+  description String?
+  videoUrl    String   // link video: URL YouTube HOẶC link file đã upload lên Vercel Blob
+  videoSource VideoSource @default(URL) // phân biệt để player render đúng cách (embed YouTube vs thẻ <video>)
+  level       String?  // CEFR: A1, A2, B1, B2, C1, C2 — để trống nếu chưa phân loại
+  category    String?
+  language    String   // dùng chung convention với Set.language ("en"/"zh")
+  createdAt   DateTime @default(now())
+
+  sentences     VideoSentence[]
+  quizQuestions VideoQuizQuestion[]
+}
+
+// Phân biệt nguồn video — quan trọng vì cách phát khác nhau hoàn toàn:
+// YOUTUBE dùng iframe embed, UPLOAD dùng thẻ <video> phát trực tiếp từ Blob URL
+enum VideoSource {
+  URL
+  YOUTUBE
+  UPLOAD
+}
+
+model VideoSentence {
+  id            String      @id @default(cuid())
+  videoLessonId String
+  videoLesson   VideoLesson @relation(fields: [videoLessonId], references: [id], onDelete: Cascade)
+  text          String
+  translation   String?     // nghĩa tiếng Việt, tùy chọn
+  startTime     Float       // giây, dùng để đồng bộ transcript với video
+  endTime       Float
+  order         Int
+
+  shadowingAttempts ShadowingAttempt[]
+  dictationAttempts DictationAttempt[]
+  savedVocabulary   VideoVocabulary[]
+}
+
+model ShadowingAttempt {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  sentenceId    String
+  sentence      VideoSentence @relation(fields: [sentenceId], references: [id], onDelete: Cascade)
+
+  transcript    String   // text nhận diện được từ giọng nói user (Web Speech API hoặc Azure)
+  accuracyScore Float    // % khớp với câu gốc, tính bằng Levenshtein (tái dùng lib/levenshtein.ts)
+
+  // 2 trường dưới đây CHỈ có giá trị khi dùng Azure Speech (Phase 6), null nếu dùng Web Speech API free
+  // Để nullable thay vì bắt buộc, tránh yêu cầu Azure ngay từ đầu — hệ thống vẫn chạy được với chỉ accuracyScore
+  pronunciationScore Float?
+  fluencyScore       Float?
+
+  createdAt DateTime @default(now())
+}
+
+model DictationAttempt {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  sentenceId String
+  sentence   VideoSentence @relation(fields: [sentenceId], references: [id], onDelete: Cascade)
+  userAnswer String
+  isCorrect  Boolean
+  createdAt  DateTime @default(now())
+}
+
+// Junction: lưu từ trong video vào Card đã có sẵn — KHÔNG tạo bảng từ vựng mới,
+// tái dùng thẳng model Card để tránh 2 nơi lưu "từ vựng" song song
+model VideoVocabulary {
+  id         String   @id @default(cuid())
+  sentenceId String
+  sentence   VideoSentence @relation(fields: [sentenceId], references: [id], onDelete: Cascade)
+  cardId     String
+  card       Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([sentenceId, cardId]) // tránh lưu trùng 1 từ nhiều lần cho cùng 1 câu
+}
+
+// Tạo riêng, KHÔNG dùng chung ReadingQuestion — để tránh rủi ro đụng chạm
+// phần Đọc đang chạy ổn định khi Quiz Video phát triển thêm loại câu hỏi riêng sau này
+model VideoQuizQuestion {
+  id            String @id @default(cuid())
+  videoLessonId String
+  videoLesson   VideoLesson @relation(fields: [videoLessonId], references: [id], onDelete: Cascade)
+  type          QuestionType // tái dùng enum QuestionType đã có (MULTIPLE_CHOICE | TRUE_FALSE)
+  question      String
+  options       String[]
+  answer        String
+}
